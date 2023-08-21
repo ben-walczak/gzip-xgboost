@@ -1,120 +1,136 @@
-
-from argparse import ArgumentParser
-import logging
-from datasets import load_dataset
+from numba import cuda, float32, jit, int32
+import numpy as np
 import pandas as pd
-import gzip
-from xgboost import XGBClassifier
+from scipy.sparse import dok_matrix
+import xgboost as xgb
 from sklearn.metrics import accuracy_score
-from multiprocessing import Pool, cpu_count
 
-def parse_args():
-    parser = ArgumentParser(
-        description = ""
-    )
-    parser.add_argument(
-        '--log_level', type=str, help='Set log level', default = "INFO"
-    )
-    parser.add_argument(
-        '--log_file', type=str, help='Set log file'
-    )
-    return parser.parse_args()
+@cuda.jit('void(uint16[:,:], uint16[:,:], uint16[:,:])')
+def kernel_function(X, Y, Z):
+    x, y = cuda.grid(2)
+    if x < X.shape[0] and y < Y.shape[0]:
+        str1 = X[x]
+        str2 = Y[y]
+        m, n = min(len(str1),150), min(len(str2),150)
+        dp = cuda.local.array((150, 150), dtype=int32)
 
-def setup_logger(log_level='INFO', log_file=None):
-    log_level = getattr(logging, log_level.upper(), logging.INFO)
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
 
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        filename=log_file,
-        filemode='a' if log_file else 'w',
-    )
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                char1 = str1[i-1]
+                char2 = str2[j-1] 
 
-    logger = logging.getLogger('my_script_logger')
+                if char1 == char2:
+                    cost = 0
+                else:
+                    cost = 1
 
-    return logger
+                dp1 = dp[i - 1][j] + 1
+                dp2 = dp[i][j - 1] + 1
+                dp3 = dp[i - 1][j - 1] + cost
+                dp[i][j] = min(dp1, dp2, dp3)
 
-def gzip_compression_distance(x1, x2):
-    Cx1 = len(gzip.compress(x1.encode()))
-    Cx2 = len(gzip.compress(x2.encode()))
-    x1x2 = " ".join([x1, x2])
-    Cx1x2 = len(gzip.compress(x1x2.encode()))
-    ncd = (Cx1x2 - min(Cx1,Cx2)) / max(Cx1, Cx2)
+        levenshtein_distance = dp[m][n]
 
-    return ncd
+        # TODO: understand why x and y need to be flipped here... is this just a numpy feature?
+        Z[y][x] = levenshtein_distance
 
-def get_features(df, text_column, target_column, new_text, k, ignore_zero_distance=False):
-    ncd_distances = {}
-    classes = {}
+def transform_str_array(array, fixed_length = 135):
+    num_texts = len(array)
+    X = dok_matrix((num_texts, fixed_length), dtype=np.uint16)
+    for i, s in enumerate(array):
+        padded_string = s.ljust(fixed_length, '\x00')
+        char_codes = np.array(list(map(ord, padded_string)), dtype=np.uint16)
+        X[i, :] = char_codes
 
-    logging.info(f"Gathering features for the following text: {new_text}")
-    
-    all_texts = df[text_column].to_list()
-    
-    distances = [gzip_compression_distance(text, new_text) for text in all_texts]
-    for index, distance in enumerate(distances):
-        if ignore_zero_distance and distance == 0:
-            continue
-        ncd_distances[index] = distance
-        classes[index] = df.iloc[index][target_column]
+    return X
 
-    top_values_set = set(sorted(ncd_distances.values())[:k])
-    
-    class_counts = {class_id: [0] * k for class_id in set(classes.values())}
+X_df = pd.read_csv("./train.csv", header = None)
+Y_df = pd.read_csv("./test.csv", header = None)
+X_df.columns = ["topic", "question_title", "question_description", "top_answer"]
+Y_df.columns = ["topic", "question_title", "question_description", "top_answer"]
+X_df["topic"] = X_df["topic"] - 1
+Y_df["topic"] = Y_df["topic"] - 1
 
-    for key, distance in ncd_distances.items():
-        class_id = classes[key]
-        if distance in top_values_set:
-            value_index = list(top_values_set).index(distance)
-            class_counts[class_id][value_index] += 1
+X1_df = X_df[:5000]
+X2_df = X_df[5000:10000]
+Y1_df = Y_df[:100]
 
-    top_features = []
-    for value, counts in zip(top_values_set, zip(*class_counts.values())):
-        for count in counts:
-            top_features.append(count / value)
+print(X1_df)
+print(X2_df)
+print(Y1_df)
 
-    logging.info(top_features)
+X1_strings = X1_df["question_title"].to_numpy(dtype=np.str_)
+X2_strings = X2_df["question_title"].to_numpy(dtype=np.str_)
+Y1_strings = Y1_df["question_title"].to_numpy(dtype=np.str_)
 
-    return top_features
+X1_matrix = transform_str_array(X1_strings)
+X2_matrix = transform_str_array(X2_strings)
+Y1_matrix = transform_str_array(Y1_strings)
 
-def get_features_parallel(args):
-    df, text_column, target_column, new_text, k, ignore_zero_distance = args
-    return get_features(df, text_column, target_column, new_text, k, ignore_zero_distance)
+X1_array = X1_matrix.toarray()
+X2_array = X2_matrix.toarray()
+Y1_array = Y1_matrix.toarray()
 
-def main():
-    args = parse_args()
-    setup_logger(args.log_level, args.log_file)
-    
-    train_set = load_dataset("yahoo_answers_topics", split="train")
-    test_set = load_dataset("yahoo_answers_topics", split="test")
-    
-    train_df = pd.DataFrame(train_set).drop(columns="id")
-    test_df = pd.DataFrame(test_set).drop(columns="id")
+print(X1_array.shape)
+print(X2_array.shape)
+print(Y1_array.shape)
 
-    columns = ["question_title", "question_content"]
-    top_k = 10
-    test_column = "topic"
+X1_n_rows = X1_array.shape[0]
+X2_n_rows = X2_array.shape[0]
+Y1_n_rows = Y1_array.shape[0]
 
-    for col in columns:
-        with Pool(cpu_count()) as pool:  # Use all available CPUs
-            all_texts_train = train_df[col].tolist()
-            logging.info("Gathering training data")
-            args_list_train = [(train_df, col, test_column, text, top_k, True) for text in all_texts_train]
-            X_list_train = pool.map(get_features_parallel, args_list_train)
-            X_train = pd.DataFrame(X_list_train)
+batch_size = 10
+n_classes = X_df["topic"].nunique()
 
-            all_texts_test = test_df[col].tolist()
-            logging.info("Gathering testing data")
-            args_list_test = [(train_df, col, test_column, text, top_k, False) for text in all_texts_test]
-            X_list_test = pool.map(get_features_parallel, args_list_test)
-            X_test = pd.DataFrame(X_list_test)
-            
-            model = XGBClassifier()
-            model.fit(X_train, train_df[test_column])
-            
-            y_pred = model.predict(X_test)
-            accuracy = accuracy_score(test_df[test_column], y_pred)
-            logging.info(accuracy)
+threadsperblock = (16, 16)
+blockspergrid_x = X1_n_rows
 
-if __name__ == "__main__":
-    main()
+distances = []
+for start in range(0, X2_n_rows, batch_size):
+    print(f"Processing training set: {start}/{X2_n_rows}")
+    end = min(start + batch_size, X2_n_rows)
+    X2_array_batch = X2_array[start:end, :]
+    blockspergrid_y = end-start
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    # TODO: understand why batch_size and X1_n_rows need to be flipped here... is this just a numpy feature?
+    batch_distances = np.zeros((end-start, X1_n_rows), dtype=np.uint16)
+    kernel_function[blockspergrid, threadsperblock](X1_array, X2_array_batch, batch_distances)
+    distances.extend(batch_distances)
+
+params = {
+    "objective":"multi:softmax", 
+    "num_class":10, 
+    "random_state":42,
+    "colsample_bytree": 0.4,
+    "gamma": 0.5,
+    "learning_rate": 0.1, 
+    "max_depth": 6,
+    "n_estimators": 200
+}
+
+X_distances = pd.DataFrame(distances)
+print(X_distances)
+
+clf_distances = xgb.XGBClassifier(**params)
+clf_distances.fit(X_distances, X2_df["topic"])
+
+distances = []
+for start in range(0, Y1_n_rows, batch_size):
+    print(f"Processing testing set: {start}/{Y1_n_rows}")
+    end = min(start + batch_size, Y1_n_rows)
+    Y1_array_batch = Y1_array[start:end, :]
+    blockspergrid_y = end-start
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    # TODO: understand why batch_size and X1_n_rows need to be flipped here... is this just a numpy feature?
+    batch_distances = np.zeros((batch_size, X1_n_rows), dtype=np.uint16)
+    kernel_function[blockspergrid, threadsperblock](X1_array, Y1_array_batch, batch_distances)
+    distances.extend(batch_distances)
+
+clf_distances_pred = clf_distances.predict(np.array(distances))
+accuracy = accuracy_score(Y1_df["topic"], clf_distances_pred)
+print(f"Accuracy: {accuracy:.4f}")
